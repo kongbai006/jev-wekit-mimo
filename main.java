@@ -76,6 +76,7 @@ String getRelation()    { String s = getString("relation", ""); return isEmpty(s
 String getActiveTalker(){ return getString("active_talker", "").trim(); }
 void setActiveTalker(String t) { putString("active_talker", t == null ? "" : t); }
 boolean isAutoAnalyze() { return getBoolean("auto_analyze", true); }
+boolean isRevokeFirst() { return getBoolean("revoke_first", true); }
 int getContextRounds() {
     int n = getInt("context_rounds", DEFAULT_CONTEXT_ROUNDS);
     return Math.max(0, Math.min(MAX_CONTEXT_ROUNDS, n));
@@ -99,8 +100,9 @@ void onHandleMsg(Object msgInfoBean) {
         log("recv: " + talker + " | " + content);
 
         // 1) 本地秒判，立刻插入系统消息。WeKit 的 insertSystemMsg 返回 Unit，
-        //    插入后立即用 queryHistoryMsg 反查最新一条拿到 msgId，供 AI 返回后撤回。
+        //    插入后立即用 queryHistoryMsg 反查最新一条拿到 msgId / msgSvrId，供 AI 返回后撤回。
         long firstId = -1L;
+        long firstSvrId = -1L;
         try {
             String quick = localQuick(talker, content);
             if (!isEmpty(quick)) {
@@ -109,9 +111,9 @@ void onHandleMsg(Object msgInfoBean) {
                     List tail = queryHistoryMsg(talker, 0L, 3);
                     if (tail != null && tail.size() > 0) {
                         Object newest = tail.get(0);
-                        // WeMessage 可能有 getMsgId() / msgId / getRowId / getCreateTime
-                        Long id = tryGetMsgId(newest);
-                        if (id != null) firstId = id.longValue();
+                        firstId = getLongField(newest, "getMsgId", -1L);
+                        firstSvrId = getLongField(newest, "getMsgSvrId", -1L);
+                        log("firstId=" + firstId + " svrId=" + firstSvrId);
                     }
                 } catch (Throwable qe) { log("tail: " + qe); }
             }
@@ -123,6 +125,8 @@ void onHandleMsg(Object msgInfoBean) {
         final String fTalker = talker;
         final String fContent = content;
         final long fFirstId = firstId;
+        final long fFirstSvrId = firstSvrId;
+        final boolean fRevoke = isRevokeFirst();
         toast("大模型分析中…");
         log("llm start: " + content);
         analyzePool.submit(new Runnable() {
@@ -131,11 +135,14 @@ void onHandleMsg(Object msgInfoBean) {
                 try {
                     String ai = callMimo(fTalker, fContent);
                     long dt = System.currentTimeMillis() - t0;
-                    log("llm cost " + dt + "ms");
+                    log("llm cost " + dt + "ms, result=" + (ai == null ? "null" : ai.length() + " chars"));
                     if (!isEmpty(ai)) {
-                        // 撤回第一轮本地判断，失败也不影响
-                        if (fFirstId > 0) {
-                            try { revokeMsg(fFirstId); } catch (Throwable re) { log("revoke: " + re); }
+                        // 撤回第一轮本地判断，先试 msgId 再试 msgSvrId
+                        if (fRevoke) {
+                            try {
+                                if (fFirstId > 0) revokeMsg(fFirstId);
+                                else if (fFirstSvrId > 0) revokeMsgByMsgSvrId(fFirstSvrId);
+                            } catch (Throwable re) { log("revoke: " + re); }
                         }
                         insertSystemMsg(fTalker, ai, System.currentTimeMillis());
                         // 复制候选到剪贴板
@@ -144,6 +151,10 @@ void onHandleMsg(Object msgInfoBean) {
                             cm.setPrimaryClip(android.content.ClipData.newPlainText("jev", isEmpty(lastClipText) ? ai : lastClipText));
                             toast("已复制3条回复到剪贴板");
                         } catch (Throwable ce) { log("clip: " + ce); }
+                    } else {
+                        // AI 失败：保留第一轮，提示错误
+                        insertSystemMsg(fTalker, "[Jev] 大模型无返回，详见日志", System.currentTimeMillis());
+                        toast("大模型无返回，请看日志");
                     }
                 } catch (Throwable e) { log("MiMo: " + e); }
             }
@@ -151,6 +162,16 @@ void onHandleMsg(Object msgInfoBean) {
     } catch (Throwable e) {
         log("onHandleMsg: " + e);
     }
+}
+
+/** 反射调无参 getter，返回 long */
+long getLongField(Object obj, String method, long def) {
+    try {
+        java.lang.reflect.Method m = obj.getClass().getMethod(method);
+        Object v = m.invoke(obj);
+        if (v instanceof Number) return ((Number) v).longValue();
+    } catch (Throwable ignore) {}
+    return def;
 }
 
 /** 从 WeMessage 反射拿 msgId，拿不到返回 null */
@@ -294,17 +315,22 @@ String callMimo(String talker, String content) {
         body.put("model", getModel());
         body.put("messages", messages);
         body.put("temperature", 0.6);
-        body.put("max_tokens", 220);
+        body.put("max_tokens", 1024);
+        body.put("stream", false);
 
         String resp = postJson(body);
-        if (isEmpty(resp)) return null;
+        if (isEmpty(resp)) { log("callMimo: empty resp"); return null; }
+        log("callMimo raw: " + (resp.length() > 400 ? resp.substring(0, 400) : resp));
         JSONObject json = new JSONObject(resp);
+        if (json.has("error")) { log("callMimo error: " + json.opt("error")); return null; }
         JSONArray choices = json.optJSONArray("choices");
-        if (choices == null || choices.length() == 0) return null;
+        if (choices == null || choices.length() == 0) { log("callMimo: no choices"); return null; }
         String text = choices.getJSONObject(0).optJSONObject("message").optString("content","");
+        if (isEmpty(text)) { log("callMimo: empty content"); return null; }
         String s = text.trim();
         int a = s.indexOf("{"), b = s.lastIndexOf("}");
-        if (a >= 0 && b > a) s = s.substring(a, b + 1);
+        if (a < 0 || b <= a) { log("callMimo: no json in: " + s); return null; }
+        s = s.substring(a, b + 1);
         JSONObject ai = new JSONObject(s);
 
         // 剪贴板只放三条回复，去掉编号，中间空行
@@ -345,12 +371,26 @@ String postJson(JSONObject body) {
         os.write(body.toString().getBytes("UTF-8"));
         os.close();
         int code = conn.getResponseCode();
-        if (code != 200) { log("MiMo HTTP " + code); return null; }
+        if (code != 200) {
+            log("MiMo HTTP " + code + " url=" + url);
+            try {
+                java.io.InputStream es = conn.getErrorStream();
+                if (es != null) {
+                    BufferedReader er = new BufferedReader(new InputStreamReader(es, "UTF-8"));
+                    StringBuilder eb = new StringBuilder(); String el;
+                    while ((el = er.readLine()) != null) eb.append(el);
+                    er.close();
+                    log("MiMo err body: " + (eb.length() > 400 ? eb.substring(0,400) : eb));
+                }
+            } catch (Throwable ignore) {}
+            return null;
+        }
         InputStream is = conn.getInputStream();
         BufferedReader r = new BufferedReader(new InputStreamReader(is, "UTF-8"));
         StringBuilder sb = new StringBuilder(); String line;
         while ((line = r.readLine()) != null) sb.append(line);
         r.close();
+        log("MiMo HTTP 200, body len=" + sb.length());
         return sb.toString();
     } catch (Throwable e) {
         log("postJson: " + e);
@@ -452,6 +492,7 @@ void showMainDialog() {
                 content.addView(createSectionTitle(activity, "总开关"));
                 content.addView(createToggleItem(activity, "自动分析对方消息", "auto_analyze", true));
                 content.addView(createToggleItem(activity, "接入大模型决策", "llm_enabled", false));
+                content.addView(createToggleItem(activity, "撤回第一轮本地判断", "revoke_first", true));
 
                 content.addView(createSectionTitle(activity, "大模型配置（任意 OpenAI 兼容）"));
                 final EditText keyInput = createInputCard(activity, content, "API 密钥（sk- 开头）", getApiKey(), false);
