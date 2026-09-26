@@ -58,6 +58,8 @@ final int ACCENT_GREEN = Color.parseColor("#4AFF9E");
 final int DIVIDER = Color.parseColor("#444444");
 
 ExecutorService analyzePool = Executors.newCachedThreadPool();
+java.util.concurrent.ScheduledExecutorService debouncePool = Executors.newSingleThreadScheduledExecutor();
+java.util.concurrent.ConcurrentHashMap pendingLlms = new java.util.concurrent.ConcurrentHashMap();
 String lastClipText = "";
 
 /** ==================== 生命周期 ==================== */
@@ -77,6 +79,7 @@ String getActiveTalker(){ return getString("active_talker", "").trim(); }
 void setActiveTalker(String t) { putString("active_talker", t == null ? "" : t); }
 boolean isAutoAnalyze() { return getBoolean("auto_analyze", true); }
 boolean isRevokeFirst() { return getBoolean("revoke_first", true); }
+boolean isManualConfirm() { return getBoolean("manual_confirm", false); }
 int getContextRounds() {
     int n = getInt("context_rounds", DEFAULT_CONTEXT_ROUNDS);
     return Math.max(0, Math.min(MAX_CONTEXT_ROUNDS, n));
@@ -99,8 +102,9 @@ void onHandleMsg(Object msgInfoBean) {
         if (getBoolean(msgInfoBean, "isGroupChat")) return;
         log("recv: " + talker + " | " + content);
 
-        // 1) 本地秒判，立刻插入系统消息。WeKit 的 insertSystemMsg 返回 Unit，
-        //    插入后立即用 queryHistoryMsg 反查最新一条拿到 msgId / msgSvrId，供 AI 返回后撤回。
+        log("recv: " + talker + " | " + content);
+
+        // 1) 第一轮本地秒判：永远立即执行（不受手动确认开关控制）
         long firstId = -1L;
         long firstSvrId = -1L;
         try {
@@ -119,49 +123,105 @@ void onHandleMsg(Object msgInfoBean) {
             }
         } catch (Throwable ie) { log("insert err: " + ie); }
 
-        // 2) 可选大模型第二轮
+        // 2) 第二轮大模型：可选
         boolean useAi = getLlm() && !isEmpty(getApiKey());
         if (!useAi) return;
-        final String fTalker = talker;
-        final String fContent = content;
-        final long fFirstId = firstId;
-        final long fFirstSvrId = firstSvrId;
-        final boolean fRevoke = isRevokeFirst();
-        toast("大模型分析中…");
-        log("llm start: " + content);
-        analyzePool.submit(new Runnable() {
-            public void run() {
-                long t0 = System.currentTimeMillis();
-                try {
-                    String ai = callMimo(fTalker, fContent);
-                    long dt = System.currentTimeMillis() - t0;
-                    log("llm cost " + dt + "ms, result=" + (ai == null ? "null" : ai.length() + " chars"));
-                    if (!isEmpty(ai)) {
-                        // 撤回第一轮本地判断，先试 msgId 再试 msgSvrId
-                        if (fRevoke) {
-                            try {
-                                if (fFirstId > 0) revokeMsg(fFirstId);
-                                else if (fFirstSvrId > 0) revokeMsgByMsgSvrId(fFirstSvrId);
-                            } catch (Throwable re) { log("revoke: " + re); }
-                        }
-                        insertSystemMsg(fTalker, ai, System.currentTimeMillis());
-                        // 复制候选到剪贴板
-                        try {
-                            android.content.ClipboardManager cm = (android.content.ClipboardManager) hostContext.getSystemService(android.content.Context.CLIPBOARD_SERVICE);
-                            cm.setPrimaryClip(android.content.ClipData.newPlainText("jev", isEmpty(lastClipText) ? ai : lastClipText));
-                            toast("已复制3条回复到剪贴板");
-                        } catch (Throwable ce) { log("clip: " + ce); }
-                    } else {
-                        // AI 失败：保留第一轮，提示错误
-                        insertSystemMsg(fTalker, "[Jev] 大模型无返回，详见日志", System.currentTimeMillis());
-                        toast("大模型无返回，请看日志");
-                    }
-                } catch (Throwable e) { log("MiMo: " + e); }
-            }
-        });
+        scheduleLlm(talker, firstId, firstSvrId);
     } catch (Throwable e) {
         log("onHandleMsg: " + e);
     }
+}
+
+void scheduleLlm(final String talker, final long firstId, final long firstSvrId) {
+    final boolean fRevoke = isRevokeFirst();
+    runLlm(talker, firstId, firstSvrId, fRevoke);
+}
+
+void runLlm(final String talker, final long firstId, final long firstSvrId, final boolean fRevoke) {
+    try {
+        // 手动确认：弹对话框，预览这一组消息
+        if (isManualConfirm()) {
+            try {
+                final android.app.Activity act = (android.app.Activity) hostContext;
+                act.runOnUiThread(new Runnable() {
+                    public void run() {
+                        try {
+                            String preview = peekRecentIncoming(talker, 8);
+                            new android.app.AlertDialog.Builder(act)
+                                .setTitle("Jev：是否调用大模型分析？")
+                                .setMessage("对方最近消息：\n" + (preview.length() > 200 ? preview.substring(0,200) + "…" : preview))
+                                .setPositiveButton("分析", new android.content.DialogInterface.OnClickListener() {
+                                    public void onClick(android.content.DialogInterface d, int w) { submitLlm(talker, firstId, firstSvrId, fRevoke); }
+                                })
+                                .setNegativeButton("忽略", null)
+                                .show();
+                        } catch (Throwable de) { log("dlg: " + de); }
+                    }
+                });
+                return;
+            } catch (Throwable ue) { log("ui thread: " + ue); }
+        }
+        submitLlm(talker, firstId, firstSvrId, fRevoke);
+    } catch (Throwable e) { log("runLlm: " + e); }
+}
+
+void submitLlm(final String talker, final long firstId, final long firstSvrId, final boolean fRevoke) {
+    toast("大模型分析中…");
+    log("llm start (debounced)");
+    analyzePool.submit(new Runnable() {
+        public void run() {
+            long t0 = System.currentTimeMillis();
+            try {
+                // 重新读最近 N 条，包含这一组连续消息
+                String content = joinRecentIncoming(talker, getContextRounds());
+                String ai = callMimo(talker, content);
+                long dt = System.currentTimeMillis() - t0;
+                log("llm cost " + dt + "ms, result=" + (ai == null ? "null" : ai.length() + " chars"));
+                if (!isEmpty(ai)) {
+                    if (fRevoke) {
+                        try {
+                            if (firstId > 0) revokeMsg(firstId);
+                            else if (firstSvrId > 0) revokeMsgByMsgSvrId(firstSvrId);
+                        } catch (Throwable re) { log("revoke: " + re); }
+                    }
+                    insertSystemMsg(talker, ai, System.currentTimeMillis());
+                    try {
+                        android.content.ClipboardManager cm = (android.content.ClipboardManager) hostContext.getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+                        cm.setPrimaryClip(android.content.ClipData.newPlainText("jev", isEmpty(lastClipText) ? ai : lastClipText));
+                        toast("已复制3条回复到剪贴板");
+                    } catch (Throwable ce) { log("clip: " + ce); }
+                } else {
+                    insertSystemMsg(talker, "[Jev] 大模型无返回，详见日志", System.currentTimeMillis());
+                    toast("大模型无返回，请看日志");
+                }
+            } catch (Throwable e) { log("MiMo: " + e); }
+        }
+    });
+}
+
+/** 只读最近 N 条 incoming 文本，拼成一段（用于 LLM 上下文） */
+String joinRecentIncoming(String talker, int n) {
+    try {
+        List tail = queryHistoryMsg(talker, 0L, Math.max(n, 1) + 5);
+        if (tail == null || tail.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        int added = 0;
+        for (int i = tail.size() - 1; i >= 0 && added < n; i--) {
+            Object m = tail.get(i);
+            boolean isSend = getBooleanField(m, "isSend", false);
+            if (isSend) continue;
+            String txt = getStringField(m, "getContent", "");
+            if (isEmpty(txt)) continue;
+            if (sb.length() > 0) sb.append(" / ");
+            sb.append(txt);
+            added++;
+        }
+        return sb.toString();
+    } catch (Throwable e) { log("joinRecent: " + e); return ""; }
+}
+
+String peekRecentIncoming(String talker, int n) {
+    return joinRecentIncoming(talker, n);
 }
 
 /** 反射调无参 getter，返回 long */
@@ -170,6 +230,24 @@ long getLongField(Object obj, String method, long def) {
         java.lang.reflect.Method m = obj.getClass().getMethod(method);
         Object v = m.invoke(obj);
         if (v instanceof Number) return ((Number) v).longValue();
+    } catch (Throwable ignore) {}
+    return def;
+}
+
+boolean getBooleanField(Object obj, String method, boolean def) {
+    try {
+        java.lang.reflect.Method m = obj.getClass().getMethod(method);
+        Object v = m.invoke(obj);
+        if (v instanceof Boolean) return ((Boolean) v).booleanValue();
+    } catch (Throwable ignore) {}
+    return def;
+}
+
+String getStringField(Object obj, String method, String def) {
+    try {
+        java.lang.reflect.Method m = obj.getClass().getMethod(method);
+        Object v = m.invoke(obj);
+        return v == null ? def : String.valueOf(v);
     } catch (Throwable ignore) {}
     return def;
 }
@@ -491,6 +569,7 @@ void showMainDialog() {
 
                 content.addView(createSectionTitle(activity, "总开关"));
                 content.addView(createToggleItem(activity, "自动分析对方消息", "auto_analyze", true));
+                content.addView(createToggleItem(activity, "大模型分析前手动确认", "manual_confirm", false));
                 content.addView(createToggleItem(activity, "接入大模型决策", "llm_enabled", false));
                 content.addView(createToggleItem(activity, "撤回第一轮本地判断", "revoke_first", true));
 
