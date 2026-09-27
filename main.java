@@ -1,8 +1,7 @@
 // ============================================================
-// Jev 聊天助手 · WA (WAuxiliary) 版 v1.0
-// 对方私聊发消息 → 本地秒判 意图/危险/情绪 → 可选 MiMo 给 3 条候选
-// 结果以「插入系统消息」形式显示在聊天里；候选需手动确认才发送。
-// 适配框架：微信 WA (WAuxiliary_Plugin)
+// Jev 聊天助手 · WeKit 版
+// 对方私聊发消息 → 本地秒判 意图/危险/情绪 → 可选大模型给 3 条候选
+// 结果以「插入系统消息」或弹窗形式显示；候选自动复制到剪贴板，手动粘贴发送。
 // ============================================================
 
 import android.app.Activity;
@@ -40,7 +39,7 @@ import java.util.concurrent.Executors;
 final String DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1";
 final String DEFAULT_MODEL = "mimo-v2.6-flash";
 
-final int DEFAULT_CONTEXT_ROUNDS = 0;
+final int DEFAULT_CONTEXT_ROUNDS = 10;
 final int MAX_CONTEXT_ROUNDS = 30;
 final int DEFAULT_PAD_CHARS = 24;
 final String PAD_ANCHOR = String.valueOf((char) 160);
@@ -61,6 +60,7 @@ ExecutorService analyzePool = Executors.newCachedThreadPool();
 java.util.concurrent.ScheduledExecutorService debouncePool = Executors.newSingleThreadScheduledExecutor();
 java.util.concurrent.ConcurrentHashMap pendingLlms = new java.util.concurrent.ConcurrentHashMap();
 String lastClipText = "";
+String lastError = "";
 
 /** ==================== 生命周期 ==================== */
 void onLoad() { }
@@ -77,10 +77,8 @@ boolean getLlm()        { return getBoolean("llm_enabled", false); }
 String getRelation()    { String s = getString("relation", ""); return isEmpty(s) ? "对方是我的关系亲密的对象" : s; }
 String getActiveTalker(){ return getString("active_talker", "").trim(); }
 void setActiveTalker(String t) { putString("active_talker", t == null ? "" : t); }
-boolean isAutoAnalyze() { return getBoolean("auto_analyze", true); }
 boolean isRevokeFirst() { return getBoolean("revoke_first", true); }
 boolean isManualConfirm() { return getBoolean("manual_confirm", false); }
-boolean isStrategyMode() { return getBoolean("strategy_mode", false); }
 boolean isNoGray() { return getBoolean("no_gray", false); }
 int getContextRounds() {
     int n = getInt("context_rounds", DEFAULT_CONTEXT_ROUNDS);
@@ -94,13 +92,32 @@ void onHandleMsg(Object msgInfoBean) {
         if (!getBoolean(msgInfoBean, "isText")) return;
         if (getBoolean(msgInfoBean, "isSend")) return;
         String talker = getString(msgInfoBean, "getTalker");
-        String content = getString(msgInfoBean, "getContent");
-        if (isEmpty(talker) || isEmpty(content)) return;
-        content = content.trim();
-        if (isEmpty(content)) return;
+        String callbackContent = getString(msgInfoBean, "getContent");
+        if (isEmpty(talker)) return;
         if (!talker.equals(getActiveTalker())) { log("skip: talker " + talker + " != active " + getActiveTalker()); return; }
         // 群聊不分析
         if (getBoolean(msgInfoBean, "isGroupChat")) return;
+
+        // 重新从历史里取最新一条对方文本，避免回调 bean 里 content 字段不对
+        String content = "";
+        try {
+            List tail = queryHistoryMsg(talker, 0L, 10);
+            if (tail != null) {
+                for (int i = 0; i < tail.size(); i++) {
+                    Object m = tail.get(i);
+                    if (getBooleanField(m, "isSend", false)) continue;
+                    String txt = getStringField(m, "getContent", "");
+                    if (isEmpty(txt)) txt = getStringField(m, "getText", "");
+                    if (isEmpty(txt)) continue;
+                    if (isOurSystemMsg(txt)) continue;
+                    content = txt.trim();
+                    break;
+                }
+            }
+        } catch (Throwable qe) { log("requery: " + qe); }
+        // 兜底：历史没取到就用回调里的
+        if (isEmpty(content)) content = callbackContent == null ? "" : callbackContent.trim();
+        if (isEmpty(content)) { log("content empty after requery"); return; }
         log("recv: " + talker + " | " + content);
 
         // 1) 第一轮本地秒判：作用域开启就立即执行
@@ -138,9 +155,24 @@ void onHandleMsg(Object msgInfoBean) {
     }
 }
 
+java.util.concurrent.ScheduledFuture pendingLlmTask = null;
+
 void scheduleLlm(final String talker, final long firstId, final long firstSvrId, final String curContent, final String quickText) {
     final boolean fRevoke = isRevokeFirst();
-    runLlm(talker, firstId, firstSvrId, fRevoke, curContent, quickText);
+    // 手动确认模式不防抖（用户点"分析"才触发）
+    if (isManualConfirm()) {
+        runLlm(talker, firstId, firstSvrId, fRevoke, curContent, quickText);
+        return;
+    }
+    // 自动模式：2 秒防抖，等对方把连续消息发完再调大模型
+    try { if (pendingLlmTask != null) pendingLlmTask.cancel(false); } catch (Throwable ignore) {}
+    pendingLlmTask = debouncePool.schedule(new Runnable() {
+        public void run() {
+            try { runLlm(talker, firstId, firstSvrId, fRevoke, curContent, quickText); }
+            catch (Throwable e) { log("debounced llm: " + e); }
+        }
+    }, 3, java.util.concurrent.TimeUnit.SECONDS);
+    log("llm scheduled in 3s (debounce)");
 }
 
 void runLlm(final String talker, final long firstId, final long firstSvrId, final boolean fRevoke, final String curContent, final String quickText) {
@@ -182,9 +214,10 @@ void submitLlm(final String talker, final long firstId, final long firstSvrId, f
         public void run() {
             long t0 = System.currentTimeMillis();
             try {
-                // 重新读最近 N 条，包含这一组连续消息
+                // 重新读最近 N 条，包含双方对话
                 String content = joinRecentIncoming(talker, getContextRounds());
-                if (content != null && content.length() > 1500) content = content.substring(content.length() - 1500);
+                log("llm content:\n" + (content == null ? "null" : (content.length() > 500 ? content.substring(0,500) + "…" : content)));
+                if (content != null && content.length() > 2000) content = content.substring(content.length() - 2000);
                 String ai = callMimo(talker, content);
                 long dt = System.currentTimeMillis() - t0;
                 log("llm cost " + dt + "ms, result=" + (ai == null ? "null" : ai.length() + " chars"));
@@ -206,9 +239,10 @@ void submitLlm(final String talker, final long firstId, final long firstSvrId, f
                         toast("已复制3条回复到剪贴板");
                     } catch (Throwable ce) { log("clip: " + ce); }
                 } else {
-                    if (isNoGray()) showResultDialog("错误", "大模型无返回，详见日志");
-                    else insertSystemMsg(talker, "[Jev] 大模型无返回，详见日志", System.currentTimeMillis());
-                    toast("大模型无返回，请看日志");
+                    String err = isEmpty(lastError) ? "大模型无返回" : lastError;
+                    if (isNoGray()) showResultDialog("错误", err);
+                    else insertSystemMsg(talker, "[Jev] " + err, System.currentTimeMillis());
+                    toast(err);
                 }
             } catch (Throwable e) { log("MiMo: " + e); }
         }
@@ -244,31 +278,56 @@ boolean isOurSystemMsg(String txt) {
     return false;
 }
 
-/** 只读最近 N 条 incoming 文本消息，拼成一段（用于 LLM 上下文）；非文字消息跳过；过滤我们自己插的系统消息 */
+/** 判断历史消息是不是自己发的，兼容不同方法名 */
+boolean isMsgSend(Object m) {
+    String[] candidates = {"isSend", "getIsSend", "isSendMessage", "send", "getSend"};
+    for (int i = 0; i < candidates.length; i++) {
+        try {
+            java.lang.reflect.Method meth = m.getClass().getMethod(candidates[i]);
+            Object v = meth.invoke(m);
+            if (v instanceof Boolean) return ((Boolean) v).booleanValue();
+        } catch (Throwable ignore) {}
+    }
+    try {
+        Method[] ms = m.getClass().getMethods();
+        for (int i = 0; i < ms.length; i++) {
+            if (ms[i].getReturnType() != boolean.class && ms[i].getReturnType() != Boolean.class) continue;
+            if (ms[i].getParameterCount() != 0) continue;
+            String nm = ms[i].getName().toLowerCase();
+            if (nm.indexOf("send") >= 0 || nm.indexOf("self") >= 0 || nm.indexOf("fromme") >= 0) {
+                Object v = ms[i].invoke(m);
+                if (v instanceof Boolean) return ((Boolean) v).booleanValue();
+            }
+        }
+    } catch (Throwable ignore) {}
+    return false;
+}
+
+/** 读最近 N 条消息（含双方），拼成一段，过滤我们自己插的系统消息 */
 String joinRecentIncoming(String talker, int n) {
     try {
-        List tail = queryHistoryMsg(talker, 0L, Math.max(n, 1) + 5);
+        List tail = queryHistoryMsg(talker, 0L, Math.max(n, 1) + 20);
         if (tail == null || tail.isEmpty()) return "";
         StringBuilder sb = new StringBuilder();
         int added = 0;
         int want = Math.max(n, 1);
-        for (int i = tail.size() - 1; i >= 0 && added < want; i--) {
+        java.util.List picked = new java.util.ArrayList();
+        for (int i = 0; i < tail.size() && added < want; i++) {
             Object m = tail.get(i);
-            boolean isSend = getBooleanField(m, "isSend", false);
-            if (isSend) continue;
+            boolean isSend = isMsgSend(m);
             String txt = getStringField(m, "getContent", "");
+            if (isEmpty(txt)) txt = getStringField(m, "getText", "");
             if (isEmpty(txt)) continue;
             if (isOurSystemMsg(txt)) continue;
-            if (sb.length() > 0) sb.append(" / ");
-            sb.append(txt);
+            picked.add((isSend ? "我：" : "对方：") + txt.trim());
             added++;
+        }
+        for (int i = picked.size() - 1; i >= 0; i--) {
+            if (sb.length() > 0) sb.append("\n");
+            sb.append(String.valueOf(picked.get(i)));
         }
         return sb.toString();
     } catch (Throwable e) { log("joinRecent: " + e); return ""; }
-}
-
-String peekRecentIncoming(String talker, int n) {
-    return joinRecentIncoming(talker, n);
 }
 
 /** 反射调无参 getter，返回 long */
@@ -299,27 +358,14 @@ String getStringField(Object obj, String method, String def) {
     return def;
 }
 
-/** 从 WeMessage 反射拿 msgId，拿不到返回 null */
-Long tryGetMsgId(Object obj) {
-    try {
-        String[] names = {"getMsgId","getRowId","getMsgSvrId","getId","msgId","rowId","msgSvrId","columnId"};
-        for (int i = 0; i < names.length; i++) {
-            try {
-                java.lang.reflect.Method m = obj.getClass().getMethod(names[i]);
-                Object v = m.invoke(obj);
-                if (v instanceof Number) return ((Number) v).longValue();
-            } catch (Throwable ignore) {}
-        }
-    } catch (Throwable e) {}
-    return null;
-}
-
 /** /jev 指令打开配置 */
 boolean onClickSendBtn(String text) {
     try {
+        log("onClickSendBtn: text=" + text);
         if (text == null) return false;
         String cmd = text.trim();
         if ("/jev".equalsIgnoreCase(cmd) || "/jev配置".equals(cmd) || "/jev设置".equals(cmd)) {
+            log("opening config...");
             showMainDialog();
             return true;
         }
@@ -408,13 +454,16 @@ JSONArray recentOtherTexts(String talker) {
         if (limit <= 0) return arr;
         List list = queryHistoryMsg(talker, 0L, limit + 1);
         if (list == null) return arr;
-        for (int i = 0; i < list.size(); i++) {
+        // newest-first，从 index 0 开始
+        for (int i = 0; i < list.size() && arr.length() < limit; i++) {
             Object bean = list.get(i);
             if (bean == null) continue;
-            if (getBoolean(bean, "isSend")) continue;
-            if (!getBoolean(bean, "isText")) continue;
-            String c = getString(bean, "getContent");
-            if (!isEmpty(c)) arr.put(c.trim());
+            if (getBooleanField(bean, "isSend", false)) continue;
+            String c = getStringField(bean, "getContent", "");
+            if (isEmpty(c)) c = getStringField(bean, "getText", "");
+            if (isEmpty(c)) continue;
+            if (isOurSystemMsg(c)) continue;
+            arr.put(c.trim());
         }
     } catch (Throwable e) { log("hist: " + e); }
     return arr;
@@ -424,59 +473,44 @@ JSONArray recentOtherTexts(String talker) {
 String callMimo(String talker, String content) {
     try {
         String rel = getRelation();
-        String sys;
-        if (isStrategyMode()) {
-            sys =
-                "你是一个恋爱聊天军师。看完对方的话，先判断当前对话阶段，再选对应策略出回复。\n" +
-                "阶段判断：承接(对方在说情绪/事情，需要被接住) / 降压(对方在施压或生气) / 调侃(关系轻松，可以开玩笑) / 轻推(暧昧期，主动推进) / 约见(聊得不错，该约线下) / 澄清(有误会或信号模糊) / 收线(聊得够了，主动收尾)。\n" +
-                "只输出 JSON，不要解释：\n" +
-                "{\"intent\":\"他在干嘛\",\"stage\":\"承接/降压/调侃/轻推/约见/澄清/收线\",\"danger\":1,\"emotion\":\"开心/难过/生气/平静\",\"pct\":0,\"action\":\"一句战术建议\",\"replies\":[\"回复1\",\"回复2\",\"回复3\"]}\n" +
-                "要求：回复短而口语，像朋友；三条风格不同；别写长句。";
-        } else {
-            sys =
-                "帮我看对方什么意思，给三条能直接发的回复。只输出 JSON：\n" +
-                "{\"intent\":\"\",\"danger\":1,\"emotion\":\"开心/难过/生气/平静\",\"pct\":0,\"action\":\"\",\"replies\":[\"\",\"\",\"\"]}\n" +
-                "回复短，口语，像朋友。danger 1=日常，9=借钱/推销/吵架/诈骗。";
-        }
+        String sys =
+            "你是聊天助手。下面是最近的对话记录，\"我：\"是用户自己发的，\"对方：\"是对方发的。\n" +
+            "帮我看对方最后这句话什么意思，给三条能直接发给对方的回复。只输出 JSON：\n" +
+            "{\"intent\":\"\",\"danger\":1,\"emotion\":\"开心/难过/生气/平静\",\"pct\":0,\"action\":\"\",\"replies\":[\"\",\"\",\"\"]}\n" +
+            "回复短，口语，像朋友。danger 1=日常，9=借钱/推销/吵架/诈骗。";
         if (!isEmpty(rel)) sys += " 关系:" + rel;
-        String typeHint = relationTypeHint();
-        if (!isEmpty(typeHint)) sys += " " + typeHint;
 
         JSONArray messages = new JSONArray();
         JSONObject sm = new JSONObject(); sm.put("role","system"); sm.put("content",sys); messages.put(sm);
-        JSONArray hist = recentOtherTexts(talker);
-        for (int i = 0; i < hist.length(); i++) {
-            JSONObject m = new JSONObject(); m.put("role","user"); m.put("content", String.valueOf(hist.get(i))); messages.put(m);
-        }
         JSONObject cur = new JSONObject(); cur.put("role","user"); cur.put("content", content); messages.put(cur);
 
         JSONObject body = new JSONObject();
         body.put("model", getModel());
         body.put("messages", messages);
         body.put("temperature", 0.6);
-        body.put("max_tokens", 400);
+        body.put("max_tokens", 1024);
         body.put("stream", false);
 
         String resp = postJson(body);
-        if (isEmpty(resp)) { log("callMimo: empty resp"); return null; }
+        if (isEmpty(resp)) { lastError = "无响应/超时，请检查网络和API地址"; log("callMimo: empty resp"); return null; }
         log("callMimo raw: " + (resp.length() > 400 ? resp.substring(0, 400) : resp));
         JSONObject json = new JSONObject(resp);
-        if (json.has("error")) { log("callMimo error: " + json.opt("error")); return null; }
+        if (json.has("error")) { lastError = "API错误: " + json.opt("error"); log("callMimo error: " + lastError); return null; }
         JSONArray choices = json.optJSONArray("choices");
-        if (choices == null || choices.length() == 0) { log("callMimo: no choices"); return null; }
+        if (choices == null || choices.length() == 0) { lastError = "无choices返回"; log("callMimo: no choices"); return null; }
         JSONObject msg = choices.getJSONObject(0).optJSONObject("message");
         String text = msg.optString("content","");
         if (isEmpty(text)) {
-            // 推理模型：content 为空但 reasoning_content 有内容
             text = msg.optString("reasoning_content","");
             log("callMimo: content empty, fallback reasoning_content len=" + text.length());
         }
-        if (isEmpty(text)) { log("callMimo: empty content"); return null; }
+        if (isEmpty(text)) { lastError = "模型返回空内容"; log("callMimo: empty content"); return null; }
         String s = text.trim();
         int a = s.indexOf("{"), b = s.lastIndexOf("}");
-        if (a < 0 || b <= a) { log("callMimo: no json in: " + s); return null; }
+        if (a < 0 || b <= a) { lastError = "返回不是JSON: " + (s.length() > 50 ? s.substring(0,50) : s); log("callMimo: no json in: " + s); return null; }
         s = s.substring(a, b + 1);
         JSONObject ai = new JSONObject(s);
+        lastError = "";
 
         // 剪贴板只放三条回复，去掉编号，中间空行
         lastClipText = "";
@@ -492,7 +526,7 @@ String callMimo(String talker, String content) {
 
         StringBuilder sb = new StringBuilder();
         sb.append(padLine("危险 " + ai.optInt("danger",3) + "/9 · " + ai.optString("emotion","") + " " + ai.optInt("pct",0) + "%")).append("\n");
-        sb.append(padLine(clip(ai.optString("intent",""), 18))).append("\n");
+        sb.append(padLine(ai.optString("intent",""))).append("\n");
         sb.append(padLine("建议 " + ai.optString("action","")));
         return sb.toString();
     } catch (Throwable e) {
@@ -510,8 +544,8 @@ String postJson(JSONObject body) {
         conn.setRequestProperty("Content-Type", "application/json");
         conn.setRequestProperty("Authorization", "Bearer " + getApiKey());
         conn.setDoOutput(true);
-        conn.setConnectTimeout(12000);
-        conn.setReadTimeout(30000);
+        conn.setConnectTimeout(15000);
+        conn.setReadTimeout(60000);
         OutputStream os = conn.getOutputStream();
         os.write(body.toString().getBytes("UTF-8"));
         os.close();
@@ -587,14 +621,17 @@ String padLine(String line) {
 
 /** ==================== 配置界面 ==================== */
 void showMainDialog() {
+    log("showMainDialog called");
     final Activity activity = getTopActivity();
-    if (activity == null) { toast("请先打开微信聊天"); return; }
+    if (activity == null) { toast("请先打开微信聊天"); log("activity null"); return; }
     final String talker = getTargetTalker();
-    if (isEmpty(talker)) { toast("请先进入一个聊天会话"); return; }
+    if (isEmpty(talker)) { toast("请先进入一个聊天会话"); log("talker empty"); return; }
+    log("activity=" + activity.getClass().getName() + " talker=" + talker);
 
     activity.runOnUiThread(new Runnable() {
         public void run() {
             try {
+                log("ui runnable start");
                 AlertDialog dialog = new AlertDialog.Builder(activity).create();
                 dialog.setCanceledOnTouchOutside(true);
                 LinearLayout root = new LinearLayout(activity);
@@ -622,7 +659,7 @@ void showMainDialog() {
                 panel.addView(headerRow);
 
                 TextView sub = new TextView(activity);
-                sub.setText("本地秒判 + 可选 MiMo 候选，手动确认才发送");
+                sub.setText("本地秒判 + 可选大模型候选，手动粘贴才发送");
                 sub.setTextSize(10); sub.setTextColor(TEXT_HINT); sub.setPadding(0, dp(6), 0, dp(14));
                 panel.addView(sub);
 
@@ -644,19 +681,15 @@ void showMainDialog() {
                 final LinearLayout llmPanel = new LinearLayout(activity);
                 llmPanel.setOrientation(LinearLayout.VERTICAL);
                 content.addView(llmPanel);
-                final android.view.View manualToggle = createToggleItem(activity, "大模型分析前手动确认（弹窗）", "manual_confirm", false);
-                llmPanel.addView(manualToggle);
-                llmPanel.addView(createToggleItem(activity, "策略模式（更准但更慢）", "strategy_mode", false));
+                llmPanel.addView(createToggleItem(activity, "大模型分析前手动确认（弹窗）", "manual_confirm", false));
                 llmPanel.addView(createToggleItem(activity, "撤回第一轮本地判断", "revoke_first", true));
-                final android.view.View noGrayToggle = createToggleItem(activity, "关闭聊天灰字（结果只走弹窗）", "no_gray", false);
-                llmPanel.addView(noGrayToggle);
+                llmPanel.addView(createToggleItem(activity, "关闭聊天灰字（结果只走弹窗）", "no_gray", false));
 
                 llmPanel.addView(createSectionTitle(activity, "大模型配置（任意 OpenAI 兼容）"));
                 final EditText keyInput = createInputCard(activity, llmPanel, "API 密钥（sk- 开头）", getApiKey(), false);
                 final EditText urlInput = createInputCard(activity, llmPanel, "API 地址（/v1 结尾，默认 MiMo）", getBaseUrl(), false);
                 final EditText modelInput = createInputCard(activity, llmPanel, "模型名（如 deepseek-chat / qwen-plus）", getModel(), false);
-                final android.widget.Spinner relTypeSpinner = createRelTypeSpinner(activity, llmPanel);
-                final EditText relInput = createInputCard(activity, llmPanel, "关系补充说明（可空，如：认识三个月）", getRelation(), false);
+                final EditText relInput = createInputCard(activity, llmPanel, "关系补充说明（如：对方是我男女朋友/想追的人/同事，认识三个月）", getRelation(), false);
                 final EditText ctxInput = createInputCard(activity, llmPanel, "上下文轮数 0-" + MAX_CONTEXT_ROUNDS, String.valueOf(getContextRounds()), true);
                 final EditText padInput = createInputCard(activity, llmPanel, "排版宽度 0=自动", String.valueOf(getInt("pad_chars", 0)), true);
 
@@ -685,7 +718,6 @@ void showMainDialog() {
                         putString("api_key", keyInput.getText().toString().trim());
                         putString("base_url", urlInput.getText().toString().trim());
                         putString("model", modelInput.getText().toString().trim());
-                        putString("relation_type", String.valueOf(relTypeSpinner.getSelectedItemPosition()));
                         putString("relation", relInput.getText().toString().trim());
                         int rounds = DEFAULT_CONTEXT_ROUNDS;
                         try { rounds = Integer.parseInt(ctxInput.getText().toString().trim()); } catch (Throwable ignore) {}
@@ -708,6 +740,7 @@ void showMainDialog() {
 
                 root.addView(panel);
                 dialog.show();
+                log("dialog shown");
                 Window w = dialog.getWindow();
                 if (w != null) {
                     w.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
@@ -728,51 +761,6 @@ View createSectionTitle(Context ctx, String text) {
     TextView tv = new TextView(ctx);
     tv.setText(text); tv.setTextSize(12); tv.setTextColor(TEXT_SUB); tv.setPadding(0, dp(12), 0, dp(6));
     return tv;
-}
-
-String[] REL_TYPE_LABELS = {"不指定", "男女朋友（亲密）", "想追的人（暧昧期）", "普通朋友", "同事（工作关系）", "客户/陌生人（客气）"};
-
-android.widget.Spinner createRelTypeSpinner(Context ctx, LinearLayout parent) {
-    LinearLayout card = new LinearLayout(ctx);
-    card.setOrientation(LinearLayout.VERTICAL); card.setBackground(createCardBg(ctx));
-    card.setPadding(dp(14), dp(12), dp(14), dp(12));
-    TextView label = new TextView(ctx);
-    label.setText("聊天对象类型"); label.setTextSize(13); label.setTextColor(TEXT_HINT);
-    card.addView(label);
-    android.widget.Spinner sp = new android.widget.Spinner(ctx);
-    android.widget.ArrayAdapter adapter = new android.widget.ArrayAdapter(ctx, android.R.layout.simple_spinner_item, REL_TYPE_LABELS);
-    adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-    sp.setAdapter(adapter);
-    int sel = 0;
-    try { sel = getInt("relation_type", 0); } catch (Throwable ignore) {}
-    if (sel >= 0 && sel < REL_TYPE_LABELS.length) sp.setSelection(sel);
-    // 选中项文字改白色
-    sp.post(new Runnable() {
-        public void run() {
-            try {
-                for (int i = 0; i < sp.getChildCount(); i++) {
-                    android.view.View v = sp.getChildAt(i);
-                    if (v instanceof TextView) ((TextView) v).setTextColor(TEXT_MAIN);
-                }
-            } catch (Throwable ignore) {}
-        }
-    });
-    card.addView(sp);
-    parent.addView(card);
-    return sp;
-}
-
-String relationTypeHint() {
-    int t = 0;
-    try { t = getInt("relation_type", 0); } catch (Throwable ignore) {}
-    switch (t) {
-        case 1: return "对方是我的男女朋友：可以亲密撒娇，但也要接住情绪，别太敷衍。";
-        case 2: return "对方是我正在追的人：保持分寸感，别过度热情，多展示价值，少追问。";
-        case 3: return "对方是普通朋友：轻松随意，别越界。";
-        case 4: return "对方是同事：专业客气，别聊私事。";
-        case 5: return "对方是客户/陌生人：礼貌周到，保持距离。";
-        default: return "";
-    }
 }
 
 EditText createInputCard(Context ctx, LinearLayout parent, String hint, String value, boolean numOnly) {
