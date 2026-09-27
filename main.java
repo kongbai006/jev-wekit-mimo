@@ -184,6 +184,7 @@ void submitLlm(final String talker, final long firstId, final long firstSvrId, f
             try {
                 // 重新读最近 N 条，包含这一组连续消息
                 String content = joinRecentIncoming(talker, getContextRounds());
+                if (content != null && content.length() > 1500) content = content.substring(content.length() - 1500);
                 String ai = callMimo(talker, content);
                 long dt = System.currentTimeMillis() - t0;
                 log("llm cost " + dt + "ms, result=" + (ai == null ? "null" : ai.length() + " chars"));
@@ -463,7 +464,13 @@ String callMimo(String talker, String content) {
         if (json.has("error")) { log("callMimo error: " + json.opt("error")); return null; }
         JSONArray choices = json.optJSONArray("choices");
         if (choices == null || choices.length() == 0) { log("callMimo: no choices"); return null; }
-        String text = choices.getJSONObject(0).optJSONObject("message").optString("content","");
+        JSONObject msg = choices.getJSONObject(0).optJSONObject("message");
+        String text = msg.optString("content","");
+        if (isEmpty(text)) {
+            // 推理模型：content 为空但 reasoning_content 有内容
+            text = msg.optString("reasoning_content","");
+            log("callMimo: content empty, fallback reasoning_content len=" + text.length());
+        }
         if (isEmpty(text)) { log("callMimo: empty content"); return null; }
         String s = text.trim();
         int a = s.indexOf("{"), b = s.lastIndexOf("}");
@@ -733,23 +740,23 @@ android.widget.Spinner createRelTypeSpinner(Context ctx, LinearLayout parent) {
     label.setText("聊天对象类型"); label.setTextSize(13); label.setTextColor(TEXT_HINT);
     card.addView(label);
     android.widget.Spinner sp = new android.widget.Spinner(ctx);
-    android.widget.ArrayAdapter adapter = new android.widget.ArrayAdapter(ctx, android.R.layout.simple_spinner_item, REL_TYPE_LABELS) {
-        public android.view.View getView(int position, android.view.View convertView, android.view.ViewGroup parent) {
-            android.view.View v = super.getView(position, convertView, parent);
-            if (v instanceof TextView) ((TextView) v).setTextColor(TEXT_MAIN);
-            return v;
-        }
-        public android.view.View getDropDownView(int position, android.view.View convertView, android.view.ViewGroup parent) {
-            android.view.View v = super.getDropDownView(position, convertView, parent);
-            if (v instanceof TextView) ((TextView) v).setTextColor(TEXT_MAIN);
-            return v;
-        }
-    };
+    android.widget.ArrayAdapter adapter = new android.widget.ArrayAdapter(ctx, android.R.layout.simple_spinner_item, REL_TYPE_LABELS);
     adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
     sp.setAdapter(adapter);
     int sel = 0;
     try { sel = getInt("relation_type", 0); } catch (Throwable ignore) {}
     if (sel >= 0 && sel < REL_TYPE_LABELS.length) sp.setSelection(sel);
+    // 选中项文字改白色
+    sp.post(new Runnable() {
+        public void run() {
+            try {
+                for (int i = 0; i < sp.getChildCount(); i++) {
+                    android.view.View v = sp.getChildAt(i);
+                    if (v instanceof TextView) ((TextView) v).setTextColor(TEXT_MAIN);
+                }
+            } catch (Throwable ignore) {}
+        }
+    });
     card.addView(sp);
     parent.addView(card);
     return sp;
